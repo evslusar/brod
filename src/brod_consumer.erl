@@ -340,27 +340,30 @@ init({Bootstrap0, Topic, Partition, Config}) ->
     false ->
       ok
   end,
-  {ok, #state{ client_pid          = ClientPid
-             , bootstrap           = Bootstrap
-             , topic               = Topic
-             , partition           = Partition
-             , begin_offset        = BeginOffset
-             , max_wait_time       = MaxWaitTime
-             , min_bytes           = MinBytes
-             , max_bytes_orig      = MaxBytes
-             , sleep_timeout       = SleepTimeout
-             , prefetch_count      = PrefetchCount
-             , prefetch_bytes      = PrefetchBytes
-             , connection          = ?undef
-             , pending_acks        = #pending_acks{}
-             , is_suspended        = false
-             , offset_reset_policy = OffsetResetPolicy
-             , avg_bytes           = 0
-             , max_bytes           = MaxBytes
-             , size_stat_window    = Cfg(size_stat_window, ?DEFAULT_AVG_WINDOW)
-             , connection_mref     = ?undef
-             , isolation_level     = IsolationLevel
-             }}.
+  {ok, State} =
+    {ok, #state{ client_pid          = ClientPid
+               , bootstrap           = Bootstrap
+               , topic               = Topic
+               , partition           = Partition
+               , begin_offset        = BeginOffset
+               , max_wait_time       = MaxWaitTime
+               , min_bytes           = MinBytes
+               , max_bytes_orig      = MaxBytes
+               , sleep_timeout       = SleepTimeout
+               , prefetch_count      = PrefetchCount
+               , prefetch_bytes      = PrefetchBytes
+               , connection          = ?undef
+               , pending_acks        = #pending_acks{}
+               , is_suspended        = false
+               , offset_reset_policy = OffsetResetPolicy
+               , avg_bytes           = 0
+               , max_bytes           = MaxBytes
+               , size_stat_window    = Cfg(size_stat_window, ?DEFAULT_AVG_WINDOW)
+               , connection_mref     = ?undef
+               , isolation_level     = IsolationLevel
+               }},
+    debug_post(consumer, init, State),
+    {ok, State}.
 
 %% @private
 handle_info(?INIT_CONNECTION, #state{subscriber = Subscriber} = State0) ->
@@ -379,6 +382,7 @@ handle_info(?INIT_CONNECTION, #state{subscriber = Subscriber} = State0) ->
       {noreply, State}
   end;
 handle_info({msg, _Pid, Rsp}, State) ->
+  debug_post(consumer, receive_fetch_response, State),
   handle_fetch_response(Rsp, State);
 handle_info(?SEND_FETCH_REQUEST, State0) ->
   State = maybe_send_fetch_request(State0),
@@ -495,11 +499,13 @@ do_debug(Pid, Debug) ->
 handle_fetch_response(#kpro_rsp{}, #state{subscriber = ?undef} = State0) ->
   %% discard fetch response when there is no (dead?) subscriber
   State = State0#state{last_req_ref = ?undef},
+  debug_post(consumer, {drop_fetch_response, no_subscriber}, State0),
   {noreply, State};
 handle_fetch_response(#kpro_rsp{ref = Ref1},
                       #state{ last_req_ref = Ref2
                             } = State) when Ref1 =/= Ref2 ->
   %% Not expected response, discard
+  debug_post(consumer, {drop_fetch_response, not_expected}, State),
   {noreply, State};
 handle_fetch_response(#kpro_rsp{ref = Ref, vsn = Vsn} = Rsp,
                       #state{ topic = Topic
@@ -511,12 +517,14 @@ handle_fetch_response(#kpro_rsp{ref = Ref, vsn = Vsn} = Rsp,
     {ok, #{ header := Header
           , batches := Batches
           }} ->
+      debug_post(consumer, handle_fetch_response, State),  
       handle_batches(Header, Batches, State, Vsn);
     {error, ErrorCode} ->
       Error = #kafka_fetch_error{ topic      = Topic
                                 , partition  = Partition
                                 , error_code = ErrorCode
                                 },
+      debug_post(consumer, {drop_fetch_response, {error, ErrorCode}}, State),                                
       handle_fetch_error(Error, State)
   end.
 
@@ -527,16 +535,19 @@ handle_batches(?undef, [], #state{} = State0, _Vsn) ->
   %% metadata (e.g. high watermark offset, or last stable offset) either.
   %% Do not advance offset, try again (maybe after a delay) with
   %% the last begin_offset in use.
+  debug_post(consumer, {handle_batches_result, nothing_to_fetch}, State0),  
   State = maybe_delay_fetch_request(State0),
   {noreply, State};
 handle_batches(_Header, ?incomplete_batch(Size),
                #state{max_bytes = MaxBytes} = State0, _Vsn) ->
   %% max_bytes is too small to fetch ONE complete batch
   true = Size > MaxBytes, %% assert
+  debug_post(consumer, {handle_batches_result, size_too_small}, State0),    
   State1 = State0#state{max_bytes = Size},
   State = maybe_send_fetch_request(State1),
   {noreply, State};
 handle_batches(Header, [], #state{begin_offset = BeginOffset} = State0, Vsn) ->
+  debug_post(consumer, {handle_batches_result, empty_fetch}, State0),  
   StableOffset = brod_utils:get_stable_offset(Header),
   State =
     case BeginOffset < StableOffset of
@@ -581,9 +592,11 @@ handle_batches(Header, Batches,
   State =
     case Messages =:= [] of
       true ->
+        debug_post(consumer, {handle_batches_result, all_messages_are_before_offset}, State0),
         %% All messages are before requested offset, hence dropped
         State1;
       false ->
+        debug_post(consumer, {handle_batches_result, ok}, State0),
         MsgSet = #kafka_message_set{ topic          = Topic
                                    , partition      = Partition
                                    , high_wm_offset = StableOffset
@@ -775,6 +788,7 @@ send_fetch_request(#state{ begin_offset = BeginOffset
     erlang:error({bad_begin_offset, BeginOffset}),
   %% MaxBytes=0 will make no progress when it's Kafka 0.9
   MaxBytes = max(12, State#state.max_bytes),
+  debug_post(consumer, send_fetch_request, State),
   Request =
     brod_kafka_request:fetch(Connection,
                              State#state.topic,
@@ -903,6 +917,7 @@ maybe_init_connection(
         , partition  = Partition
         , connection = ?undef
         } = State0) ->
+  debug_post(consumer, init_connection, State0),
   %% Lookup, or maybe (re-)establish a connection to partition leader
   {MonitorOrLink, Result} = connect_leader(ClientPid, Bootstrap, Topic, Partition),
   case Result of
@@ -917,8 +932,10 @@ maybe_init_connection(
                           , connection = Connection
                           , connection_mref = Mref
                           },
+      debug_post(consumer, connect_ok, State),
       {ok, State};
     {error, Reason} ->
+      debug_post(consumer, connect_error, State0),      
       {{error, {connect_leader, Reason}}, State0}
   end;
 maybe_init_connection(State) ->
@@ -944,12 +961,23 @@ link_connect_leader({Endpoints, ConnCfg}, Topic, Partition) ->
 
 %% Send a ?INIT_CONNECTION delayed loopback message to re-init.
 -spec maybe_send_init_connection(state()) -> ok.
-maybe_send_init_connection(#state{subscriber = Subscriber}) ->
+maybe_send_init_connection(#state{subscriber = Subscriber} = State) ->
   Timeout = ?CONNECTION_RETRY_DELAY_MS,
   %% re-init payload connection only when subscriber is alive
   brod_utils:is_pid_alive(Subscriber) andalso
+    debug_post(consumer, send_reconnect, State) andalso
     erlang:send_after(Timeout, self(), ?INIT_CONNECTION),
   ok.
+
+debug_post(Module, Action, #state{
+  client_pid = CP,
+  connection = C,
+  topic = T,
+  partition = P,
+  subscriber = S
+  }) ->
+  debug_helper:post(Module, Action, 
+    #{client => CP, conn => C, topic => T, partition => P, sub => S}), true.
 
 %%%_* Tests ====================================================================
 
@@ -994,3 +1022,4 @@ pending_acks_test() ->
 %%% allout-layout: t
 %%% erlang-indent-level: 2
 %%% End:
+

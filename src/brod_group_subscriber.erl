@@ -322,6 +322,7 @@ init({Client, GroupId, Topics, GroupConfig,
   {ok, State}.
 
 handle_info({_ConsumerPid, #kafka_message_set{} = MsgSet}, State0) ->
+  debug_post(group_subscriber, receive_batches, State0),
   State = handle_consumer_delivery(MsgSet, State0),
   {noreply, State};
 handle_info({'DOWN', Mref, process, _Pid, _Reason},
@@ -473,10 +474,13 @@ handle_consumer_delivery(#kafka_message_set{ topic     = Topic
       Consumers = update_last_offset(Messages, C, Consumers0),
       State = State0#state{consumers = Consumers},
       case MsgType of
-        message -> handle_messages(Topic, Partition, Messages, State);
+        message ->
+          debug_post(group_subscriber, {handle_messages_list, ok}, State0),          
+          handle_messages(Topic, Partition, Messages, State);
         message_set -> handle_message_set(MsgSet, State)
       end;
     false ->
+      debug_post(group_subscriber, {handle_consumer_delivery, no_consumer}, State0),      
       State0
   end.
 
@@ -500,6 +504,7 @@ handle_message_set(MessageSet, State) ->
                     , messages  = Messages
                     } = MessageSet,
   #state{cb_module = CbModule, cb_state = CbState} = State,
+  debug_post(group_subscriber, {handle_message_set, ok}, State),
   {AckNow, CommitNow, NewCbState} =
     case CbModule:handle_message(Topic, Partition, MessageSet, CbState) of
       {ok, NewCbState_} ->
@@ -642,6 +647,14 @@ get_consumer({_, _} = TP, Consumers) ->
 
 put_consumer(#consumer{topic_partition = TP} = C, Consumers) ->
   lists:keyreplace(TP, #consumer.topic_partition, Consumers, C).
+
+debug_post(Module, Action, #state{
+  client = C,
+  groupId = G,
+  cb_module = CB
+  }) ->
+  debug_helper:post(Module, Action, 
+    #{client => C, group => G, cb => CB}), true.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:
